@@ -341,7 +341,7 @@ def main() -> int:
             new_id, note = "", ""
             if client is not None:
                 try:
-                    found = client.tasks.list(filter=f'{{"and":[{{"==":[{{"var":"name"}},"{new_name}"]}}]}}')
+                    found = [t for t in client.tasks.list() if t.name == new_name]
                     if found:
                         new_id = max(t.id for t in found)
                         if not args.no_job_states and name_map:
