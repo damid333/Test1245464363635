@@ -1,0 +1,9 @@
+import pandas as pd
+
+by_task = pd.read_csv('audit/by_task.csv')
+by_task['states'] = by_task['states'].fillna('')
+
+want = by_task[by_task['states'].str.contains('completed|in progress')]
+want[['task_id', 'task_name']].to_csv('to_restore.csv', index=False)
+
+print(len(want), 'тасок,', int(want['boxes'].sum()), 'боксов')
