@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-Восстановление удалённых тасок CVAT из выгрузки cveta2 (raw.csv).
+Восстановление удалённых тасок CVAT из выгрузки (raw.csv).
 
 Что делает:
-  1. Берёт список task_id, которые были удалены (cvat_tasks_to_clean.csv или --task-ids).
+  1. Берёт список task_id, которые были удалены (--tasks-csv или --task-ids).
   2. Для каждой таски вытаскивает из raw.csv ВСЕ строки (включая instance_shape='none',
      чтобы не потерять кадры без разметки), сортирует по frame_id.
-  3. Создаёт таску заново через cveta2 и заливает в неё боксы.
+  3. Создаёт таску заново через  и заливает в неё боксы.
+     Имя — следующий свободный номер в её ветке *_GK_N (счётчики раздельные
+     для dislike_*, test_dislike_*, errors_monitor_* и т.д.).
   4. Восстанавливает job_stage / job_state по каждому job, сопоставляя кадры по имени файла.
   5. Пишет чекпоинт, чтобы можно было прервать и продолжить.
 
@@ -17,16 +19,18 @@
   - любые фигуры кроме rectangle — cveta2 их при fetch вообще не выгружал.
 
 Порядок запуска:
-    python restore_cvat_tasks.py ... --dry-run          # preflight, ничего не создаёт
-    python restore_cvat_tasks.py ... --limit 1          # одна таска, глазами проверить в UI
-    python restore_cvat_tasks.py ...                    # всё остальное
+    python restore_cvat_tasks.py ... --dry-run      # preflight, ничего не создаёт
+    python restore_cvat_tasks.py ... --limit 1      # одна таска, глазами проверить в UI
+    python restore_cvat_tasks.py ...                # всё остальное
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 import pandas as pd
@@ -40,6 +44,9 @@ STAGE_RANK = {"annotation": 0, "validation": 1, "acceptance": 2}
 STATE_RANK = {"rejected": 0, "new": 1, "in progress": 2, "completed": 3}
 
 CHECKPOINT_COLUMNS = ["old_task_id", "old_task_name", "new_task_id", "new_task_name", "status", "note"]
+
+# Разбор имени таски на префикс и номер: test_dislike_ctm_nta4_GK_391 -> (test_dislike_ctm_nta4, 391)
+RX = re.compile(r"^(.*)_GK_(\d+)$")
 
 
 # ---------------------------------------------------------------------------
@@ -122,8 +129,8 @@ def build_task_payload(d: pd.DataFrame, include_deleted_frames: bool):
     """
     Возвращает (content, annotations, name_to_stage_state, skipped_deleted).
 
-    content        — список s3-путей в порядке исходного frame_id;
-    annotations    — датафрейм только с боксами (его ждёт cveta2);
+    content             — список s3-путей в порядке исходного frame_id;
+    annotations         — датафрейм только с боксами (его ждёт cveta2);
     name_to_stage_state — {image_name: (stage, state)} для восстановления статусов jobs.
     """
     d = d.sort_values("frame_id", kind="stable")
@@ -226,7 +233,8 @@ def main() -> int:
     p.add_argument("--cvat-name", default="sip", help="имя конфига подключения для cveta2 CVAT()")
     p.add_argument("--segment-size", type=int, default=100, help="размер job у создаваемых тасок")
     p.add_argument("--image-quality", type=int, default=100)
-    p.add_argument("--name-suffix", default="_restored", help="суффикс к исходному имени таски")
+    p.add_argument("--number-gap", type=int, default=1,
+                   help="на сколько отступить от последнего занятого номера (запас, если пайплайн активен)")
     p.add_argument("--include-deleted-frames", action="store_true",
                    help="включать в таску кадры, помеченные в CVAT как удалённые")
     p.add_argument("--no-job-states", action="store_true", help="не восстанавливать stage/state")
@@ -298,11 +306,37 @@ def main() -> int:
             client = make_client(host=host, credentials=(user, password))
             client.__enter__()
 
+    # --- следующие свободные номера, отдельно по каждому префиксу -----------
+    next_num: dict[str, int] = {}
+    if client is not None:
+        maxima: dict[str, int] = defaultdict(int)
+        for t in client.tasks.list():
+            m = RX.match(t.name or "")
+            if m:
+                maxima[m.group(1)] = max(maxima[m.group(1)], int(m.group(2)))
+        next_num = {pref: n + args.number_gap for pref, n in maxima.items()}
+        for pref, n in sorted(next_num.items()):
+            logger.info(f"{pref}_GK_*: продолжаю с {n}")
+    if not next_num:
+        raise SystemExit(
+            "не удалось определить последние номера — нужен доступ к CVAT "
+            "(задай CVAT_HOST/CVAT_USER/CVAT_PASS и не используй --no-job-states)"
+        )
+
     try:
         for i, tid in enumerate(todo, 1):
             d = raw[raw["task_id"] == tid]
             old_name = str(d["task_name"].dropna().iloc[0])
-            new_name = f"{old_name}{args.name_suffix}"
+
+            m = RX.match(old_name)
+            if not m:
+                logger.warning(f"  имя не по шаблону *_GK_N, оставляю как есть: {old_name}")
+                new_name = old_name
+            else:
+                prefix = m.group(1)
+                n = next_num.get(prefix, int(m.group(2)) + args.number_gap)
+                new_name = f"{prefix}_GK_{n}"
+                next_num[prefix] = n + 1
 
             content, annotations, name_map, skipped = build_task_payload(d, args.include_deleted_frames)
             logger.info(
@@ -318,7 +352,7 @@ def main() -> int:
                 continue
 
             try:
-                cvat.create_task(
+                new_task_id = cvat.create_task(
                     name=new_name,
                     labels=None,
                     content=content,
@@ -337,15 +371,20 @@ def main() -> int:
                     "new_task_name": new_name, "status": "failed", "note": str(e)[:300]})
                 continue
 
-            # create_task не возвращает id — находим свежесозданную таску по имени
             new_id, note = "", ""
             if client is not None:
                 try:
-                    found = [t for t in client.tasks.list() if t.name == new_name]
-                    if found:
-                        new_id = max(t.id for t in found)
-                        if not args.no_job_states and name_map:
-                            note = restore_job_states(client, new_id, name_map)
+                    if new_task_id:
+                        new_id = int(new_task_id)
+                    else:
+                        # create_task не вернул id — спрашиваем сервер по имени
+                        data, _ = client.api_client.tasks_api.list(name=new_name, page_size=100)
+                        found = [t for t in data.results if t.name == new_name]
+                        if found:
+                            new_id = max(t.id for t in found)
+
+                    if new_id and not args.no_job_states and name_map:
+                        note = restore_job_states(client, new_id, name_map)
                 except Exception as e:  # noqa: BLE001
                     logger.warning(f"  не удалось доработать статусы: {e}")
                     note = f"stage/state FAILED: {e}"[:300]
@@ -362,4 +401,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main()
