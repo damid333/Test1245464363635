@@ -1,0 +1,15 @@
+# экспорт
+python -m fcos_train.export_two_graphs \
+    --config runs/train2/config.yaml \
+    --ckpt runs/train2/best.pth \
+    --out runs/train2/two_graphs
+
+# тест на картинке
+python -m fcos_train.infer_two_graphs \
+    --graphs runs/train2/two_graphs \
+    --image /mnt/disk01/data/di.lashenkov/dataset/nt4/coco_20260728_2class/train/00113951_03_00005.jpg
+
+# замер vs torch (16.6 ms)
+python -m fcos_train.infer_two_graphs \
+    --graphs runs/train2/two_graphs \
+    --bench /mnt/disk01/data/di.lashenkov/dataset/nt4/coco_20260728_2class/val
