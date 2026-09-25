@@ -1,0 +1,77 @@
+# src/fcos_train/bench_torch.py
+from __future__ import annotations
+
+import argparse
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from .config import load_config
+from .model import build_model
+
+
+def load_image(path: str, device="cuda") -> torch.Tensor:
+    import cv2
+    bgr = cv2.imread(str(path))
+    if bgr is None:
+        raise FileNotFoundError(path)
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    return torch.from_numpy(rgb).permute(2, 0, 1).to(device)
+
+
+def bench(model, images: list[torch.Tensor], n: int = 100, warmup: int = 20):
+    # warmup — без замера
+    for i in range(warmup):
+        with torch.no_grad():
+            model([images[i % len(images)]])
+    torch.cuda.synchronize()
+
+    times = []
+    for i in range(n):
+        img = images[i % len(images)]
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        with torch.no_grad():
+            model([img])
+        torch.cuda.synchronize()
+        times.append((time.perf_counter() - t0) * 1000)
+
+    times = np.array(times)
+    print(f"torch Faster R-CNN  (n={n})")
+    print(f"  mean   = {times.mean():.1f} ms")
+    print(f"  median = {np.median(times):.1f} ms")
+    print(f"  p95    = {np.percentile(times, 95):.1f} ms")
+    print(f"  fps    = {1000 / times.mean():.1f}")
+    return times
+
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--config", required=True)
+    p.add_argument("--ckpt",   required=True)
+    p.add_argument("--images", required=True, help="директория с картинками")
+    p.add_argument("--n",      type=int, default=100)
+    p.add_argument("--warmup", type=int, default=20)
+    p.add_argument("--device", default="cuda")
+    a = p.parse_args()
+
+    cfg  = load_config(a.config)
+    ckpt = torch.load(a.ckpt, map_location="cpu")
+    nc   = int(ckpt.get("num_classes", cfg.model.num_classes))
+
+    model = build_model(cfg.model, nc)
+    model.load_state_dict(ckpt.get("model", ckpt))
+    model.eval().to(a.device)
+
+    paths = sorted(Path(a.images).glob("*.jpg"))[:a.n + a.warmup]
+    if not paths:
+        paths = sorted(Path(a.images).glob("*.png"))[:a.n + a.warmup]
+    if not paths:
+        raise FileNotFoundError(f"нет jpg/png в {a.images}")
+
+    print(f"загружаю {min(len(paths), 10)} картинок...")
+    imgs = [load_image(p, a.device) for p in paths[:10]]
+
+    bench(model, imgs, n=a.n, warmup=a.warmup)
