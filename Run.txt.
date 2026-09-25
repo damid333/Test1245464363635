@@ -1,0 +1,15 @@
+# одна картинка
+python -m fcos_train.infer_onnx \
+    --onnx frcnn.onnx \
+    --images data/val/images/001.jpg
+
+# несколько + визуализация
+python -m fcos_train.infer_onnx \
+    --onnx frcnn.onnx \
+    --images data/val/images/*.jpg \
+    --vis
+
+# только замер скорости
+python -m fcos_train.infer_onnx \
+    --onnx frcnn.onnx \
+    --bench
