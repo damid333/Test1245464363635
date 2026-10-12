@@ -1,0 +1,18 @@
+D=/mnt/disk01/data/di.lashenkov/dataset/nta4/coco_20260728_2class
+SPL="--val-ann $D/annotations/instances_val.json --val-img-dir $D/val \
+     --test-ann $D/annotations/instances_test.json --test-img-dir $D/test"
+R=/mnt/disk01/codebase/di.lashenkov/build_r-cnn/fcos/src/runs
+
+# 1) GT один раз
+python -m fcos_train.dm_predict gt $SPL --train-ann $D/annotations/instances_train.json --out-dir dm
+
+# 2) предсказания: каждая модель в своём окружении
+python -m fcos_train.dm_predict preds --name frcnn_train7_torch --backend torch \
+    --config $R/train7/config.yaml --ckpt $R/train7/best.pth $SPL --out-dir dm
+python -m fcos_train.dm_predict preds --name frcnn_train7_onnx_trt_fp16 --backend onnx1 --ep trt_fp16 \
+    --export-dir $R/train7/onnx_single $SPL --out-dir dm
+python dm_predict.py preds --name yolo12 --backend yolo --weights <yolo12.pt> --imgsz <...> $SPL --out-dir dm
+python dm_predict.py preds --name mmdet_prod --backend mmdet --config <prod.py> --ckpt <prod.pth> $SPL --out-dir dm
+
+# 3) метрики по всем сразу (окружение с digital-metrics)
+python -m fcos_train.dm_evaluate --gt dm/gt.csv --preds dm/preds_*.csv --out-dir dm/results
